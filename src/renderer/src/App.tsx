@@ -4,6 +4,7 @@ type CaptureResult = Awaited<ReturnType<typeof window.api.captureAndTranslate>>
 type TranslateResult = Awaited<ReturnType<typeof window.api.translateText>>
 type CaptureSessionPayload = Awaited<ReturnType<typeof window.api.getCaptureSession>>
 type CaptureProbeResult = Awaited<ReturnType<typeof window.api.probeCaptureSupport>>
+type OcrProgress = Parameters<Parameters<typeof window.api.onOcrProgress>[0]>[0]
 
 type LanguageOption = {
   label: string
@@ -172,6 +173,7 @@ function MainWorkspace(): React.JSX.Element {
   const [sourceLanguage, setSourceLanguage] = useState('en-US')
   const [targetLanguage, setTargetLanguage] = useState('zh-Hans')
   const [result, setResult] = useState<CaptureResult | null>(null)
+  const [partialOcr, setPartialOcr] = useState<OcrProgress | null>(null)
   const [manualText, setManualText] = useState('')
   const [manualTranslation, setManualTranslation] = useState<TranslateResult | null>(null)
   const [busyAction, setBusyAction] = useState<'capture' | 'clipboard' | 'manual' | null>(null)
@@ -187,6 +189,14 @@ function MainWorkspace(): React.JSX.Element {
     () => targetLanguages.find((item) => item.value === targetLanguage)?.label ?? targetLanguage,
     [targetLanguage]
   )
+  const busyHint =
+    busyAction === 'capture'
+      ? '正在截图、OCR 识别并调用本地 Hy-MT2 模型翻译。首次运行可能需要下载或加载模型，请稍等。'
+      : busyAction === 'clipboard'
+        ? '正在读取剪贴板图片、OCR 识别并调用本地 Hy-MT2 模型翻译。'
+        : busyAction === 'manual'
+          ? '正在调用本地 Hy-MT2 模型翻译文本。'
+          : null
 
   async function refreshProbe(): Promise<void> {
     setProbing(true)
@@ -209,9 +219,16 @@ function MainWorkspace(): React.JSX.Element {
     void refreshProbe()
   }, [])
 
+  useEffect(() => {
+    return window.api.onOcrProgress((payload) => {
+      setPartialOcr(payload)
+    })
+  }, [])
+
   async function runAction(action: 'capture' | 'clipboard'): Promise<void> {
     setBusyAction(action)
     setError(null)
+    setPartialOcr(null)
 
     try {
       const response =
@@ -220,6 +237,7 @@ function MainWorkspace(): React.JSX.Element {
           : await window.api.translateClipboardImage({ sourceLanguage, targetLanguage })
 
       setResult(response)
+      setPartialOcr(null)
       if (action === 'capture') {
         void refreshProbe()
       }
@@ -338,7 +356,7 @@ function MainWorkspace(): React.JSX.Element {
               disabled={busyAction !== null}
             >
               {busyAction === 'capture'
-                ? '等待你完成截图...'
+                ? '截图识别翻译中...'
                 : probe?.preferredMode === 'system-fallback'
                   ? '系统截图并翻译'
                   : '框选截图并翻译'}
@@ -352,6 +370,7 @@ function MainWorkspace(): React.JSX.Element {
               {busyAction === 'clipboard' ? '读取剪贴板中...' : '翻译剪贴板图片'}
             </button>
           </div>
+          {busyHint && <p className="busy-hint">{busyHint}</p>}
 
           <div className="usage-card">
             <h3>怎么用</h3>
@@ -458,6 +477,46 @@ function MainWorkspace(): React.JSX.Element {
                   ))}
                 </div>
               )}
+            </div>
+          ) : partialOcr ? (
+            <div className="result-stack">
+              <div className="shot-preview">
+                <img src={partialOcr.imageDataUrl} alt="当前截图预览" />
+              </div>
+
+              <div className="meta-grid">
+                <div className="meta-card">
+                  <span>OCR 引擎</span>
+                  <strong>{partialOcr.ocrProvider}</strong>
+                </div>
+                <div className="meta-card">
+                  <span>翻译引擎</span>
+                  <strong>Hy-MT2 1.8B GGUF</strong>
+                </div>
+              </div>
+
+              <div className="text-columns">
+                <section className="text-card">
+                  <div className="text-card-head">
+                    <h3>OCR 原文</h3>
+                    <button
+                      className="text-button"
+                      type="button"
+                      onClick={() => void navigator.clipboard.writeText(partialOcr.recognizedText)}
+                    >
+                      复制
+                    </button>
+                  </div>
+                  <pre>{partialOcr.recognizedText || '没有识别到文本。'}</pre>
+                </section>
+
+                <section className="text-card">
+                  <div className="text-card-head">
+                    <h3>翻译结果</h3>
+                  </div>
+                  <pre>OCR 已完成，正在等待本地 Hy-MT2 模型返回翻译结果...</pre>
+                </section>
+              </div>
             </div>
           ) : (
             <div className="empty-state">

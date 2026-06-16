@@ -8,6 +8,16 @@ import { electronApp, is, optimizer } from '@electron-toolkit/utils'
 import icon from '../../resources/icon.png?asset'
 
 const execFileAsync = promisify(execFile)
+const HY_MT_MODEL = 'tencent/Hy-MT2-1.8B-GGUF:Q4_K_M'
+const HY_MT_LOCAL_MODEL = join(process.cwd(), 'models', 'Hy-MT2-1.8B-GGUF', 'Hy-MT2-1.8B-Q4_K_M.gguf')
+const HY_MT_MAX_TOKENS = '512'
+const HY_MT_TIMEOUT_MS = 10 * 60_000
+const LLAMA_CLI_CANDIDATES = [
+  process.env['LLAMA_CLI_PATH'],
+  '/opt/homebrew/bin/llama-cli',
+  '/usr/local/bin/llama-cli',
+  'llama-cli'
+].filter((item): item is string => Boolean(item))
 
 app.commandLine.appendSwitch('enable-features', 'TranslationAPI,LanguageDetectionAPI')
 
@@ -39,6 +49,14 @@ type ProcessedCapture = {
   notices: string[]
 }
 
+type OcrProgressPayload = {
+  imageDataUrl: string
+  recognizedText: string
+  sourceLanguage: string
+  targetLanguage: string
+  ocrProvider: string
+}
+
 type CaptureSession = {
   request: CaptureRequest
   imageDataUrl: string
@@ -59,6 +77,16 @@ type CaptureProbeResult = {
   preferredMode: 'overlay' | 'system-fallback'
   available: boolean
   message: string
+}
+
+const languageNames: Record<string, string> = {
+  'zh-Hans': '简体中文',
+  'zh-Hant': '繁体中文',
+  'en-US': '英语',
+  'ja-JP': '日语',
+  'ko-KR': '韩语',
+  'fr-FR': '法语',
+  'de-DE': '德语'
 }
 
 let mainWindow: BrowserWindow | null = null
@@ -267,82 +295,208 @@ async function captureFromClipboard(): Promise<Electron.NativeImage> {
   return image
 }
 
-async function translateWithRuntimeApi({ text, sourceLanguage, targetLanguage }: TranslateRequest): Promise<TranslationResult> {
-  const translatorWindow = new BrowserWindow({
-    show: false,
-    webPreferences: {
-      sandbox: false
+async function translateText(request: TranslateRequest): Promise<TranslationResult> {
+  return translateWithHyMt(request)
+}
+
+function getLanguageName(language: string): string {
+  return languageNames[language] ?? language
+}
+
+function buildHyMtPrompt({ text, targetLanguage }: TranslateRequest): string {
+  return `将以下文本翻译为 ${getLanguageName(targetLanguage)}，注意只需要输出翻译后的结果，不要额外解释：\n\n${text}`
+}
+
+async function resolveLlamaCliPath(): Promise<string> {
+  for (const candidate of LLAMA_CLI_CANDIDATES) {
+    if (candidate === 'llama-cli') {
+      return candidate
     }
-  })
+
+    try {
+      await fs.access(candidate)
+      return candidate
+    } catch {
+      continue
+    }
+  }
+
+  return 'llama-cli'
+}
+
+async function resolveHyMtModelArgs(): Promise<string[]> {
+  const localModelCandidates = [process.env['HY_MT_MODEL_PATH'], HY_MT_LOCAL_MODEL].filter(
+    (item): item is string => Boolean(item)
+  )
+
+  for (const candidate of localModelCandidates) {
+    try {
+      await fs.access(candidate)
+      return ['-m', candidate]
+    } catch {
+      continue
+    }
+  }
+
+  return ['-hf', HY_MT_MODEL]
+}
+
+function cleanHyMtOutput(output: string, prompt: string, sourceText: string): string {
+  let text = output
+    .replace(/\u001b\[[0-9;]*m/g, '')
+    .replace(/[\b\r]/g, '')
+    .trim()
+
+  const sourceIndex = text.lastIndexOf(sourceText)
+  if (sourceIndex >= 0) {
+    text = text.slice(sourceIndex + sourceText.length).trim()
+  }
+
+  const promptIndex = text.lastIndexOf(prompt)
+  if (promptIndex >= 0) {
+    text = text.slice(promptIndex + prompt.length).trim()
+  }
+
+  if (text.startsWith(prompt)) {
+    text = text.slice(prompt.length).trim()
+  }
+
+  return text
+    .replace(/\[ Prompt:[\s\S]*$/i, '')
+    .replace(/Exiting\.\.\.[\s\S]*$/i, '')
+    .split('\n')
+    .map((line) => line.replace(/^[|/\\-]+\s*/, '').trimEnd())
+    .filter((line) => {
+      const trimmed = line.trim()
+      return (
+        trimmed &&
+        !trimmed.startsWith('Loading model') &&
+        !trimmed.startsWith('build      :') &&
+        !trimmed.startsWith('model      :') &&
+        !trimmed.startsWith('modalities :') &&
+        !trimmed.startsWith('available commands:') &&
+        !trimmed.startsWith('/exit') &&
+        !trimmed.startsWith('/regen') &&
+        !trimmed.startsWith('/clear') &&
+        !trimmed.startsWith('/read') &&
+        !trimmed.startsWith('/glob') &&
+        !trimmed.startsWith('>') &&
+        !trimmed.startsWith('▄▄') &&
+        !trimmed.startsWith('██') &&
+        !trimmed.startsWith('▀▀')
+      )
+    })
+    .join('\n')
+    .replace(/^翻译结果[:：]\s*/i, '')
+    .replace(/^译文[:：]\s*/i, '')
+    .trim()
+}
+
+function describeCliError(error: unknown): string {
+  if (!(error instanceof Error)) {
+    return String(error)
+  }
+
+  const details = error as Error & { code?: string | number; signal?: string; stderr?: string; stdout?: string }
+  const parts = [error.message]
+
+  if (details.code) {
+    parts.push(`code=${details.code}`)
+  }
+
+  if (details.signal) {
+    parts.push(`signal=${details.signal}`)
+  }
+
+  const stderr = details.stderr?.trim()
+  if (stderr) {
+    parts.push(stderr.slice(-1200))
+  }
+
+  const stdout = details.stdout?.trim()
+  if (stdout) {
+    parts.push(stdout.slice(-600))
+  }
+
+  return parts.join('\n')
+}
+
+async function translateWithHyMt(request: TranslateRequest): Promise<TranslationResult> {
+  if (!request.text.trim()) {
+    return {
+      provider: 'Hy-MT2 1.8B GGUF',
+      text: null,
+      warning: '没有可翻译的文本。'
+    }
+  }
+
+  const prompt = buildHyMtPrompt(request)
 
   try {
-    await translatorWindow.loadURL('data:text/html;charset=utf-8,<html><body></body></html>')
+    const llamaCliPath = await resolveLlamaCliPath()
+    const modelArgs = await resolveHyMtModelArgs()
+    console.info(`[translate] starting ${modelArgs.join(' ')} with ${llamaCliPath}`)
+    const { stdout, stderr } = await execFileAsync(
+      llamaCliPath,
+      [
+        ...modelArgs,
+        '--device',
+        'none',
+        '--single-turn',
+        '--no-display-prompt',
+        '--simple-io',
+        '-p',
+        prompt,
+        '-n',
+        HY_MT_MAX_TOKENS
+      ],
+      {
+        maxBuffer: 16 * 1024 * 1024,
+        timeout: HY_MT_TIMEOUT_MS
+      }
+    )
+    const translatedText =
+      cleanHyMtOutput(stdout, prompt, request.text) || cleanHyMtOutput(`${stdout}\n${stderr}`, prompt, request.text)
+    console.info(`[translate] finished, output chars=${translatedText.length}, preview=${translatedText.slice(0, 80)}`)
 
-    const result = (await translatorWindow.webContents.executeJavaScript(
-      `(${async ({ inputText, source, target }) => {
-        const response = {
-          provider: 'Chromium Translator API',
-          text: null,
-          warning: undefined
-        } as any
-
-        try {
-          if (!inputText.trim()) {
-            response.warning = '没有可翻译的文本。'
-            return response
-          }
-
-          const translationAPI = (window as any).translation
-          if (typeof translationAPI === 'undefined') {
-            response.warning = '当前运行时没有暴露 Translation API。'
-            return response
-          }
-
-          const availability = await translationAPI.canTranslate({
-            sourceLanguage: source,
-            targetLanguage: target
-          })
-
-          if (availability === 'no') {
-            response.warning = '当前系统未提供可用的本地翻译模型。'
-            return response
-          }
-
-          const translator = await translationAPI.createGenericTranslator({
-            sourceLanguage: source,
-            targetLanguage: target
-          })
-
-          response.text = await translator.translate(inputText)
-          if (translator && typeof translator.destroy === 'function') {
-            translator.destroy()
-          }
-
-          return response
-        } catch (error) {
-          response.warning = error instanceof Error ? error.message : String(error)
-          return response
-        }
-      }})(${JSON.stringify({ inputText: text, source: sourceLanguage, target: targetLanguage })})`,
-      true
-    )) as TranslationResult
-
-    return result
-  } finally {
-    translatorWindow.destroy()
+    return {
+      provider: 'Hy-MT2 1.8B GGUF',
+      text: translatedText || null,
+      warning: translatedText ? undefined : stderr.trim() || 'llama-cli 未返回翻译结果。'
+    }
+  } catch (error) {
+    return {
+      provider: 'Hy-MT2 1.8B GGUF',
+      text: null,
+      warning: `llama-cli 翻译失败: ${describeCliError(error)}`
+    }
   }
 }
 
-async function translateText(request: TranslateRequest): Promise<TranslationResult> {
-  return translateWithRuntimeApi(request)
+function emitOcrProgress(payload: OcrProgressPayload): void {
+  mainWindow?.webContents.send('ocr:progress', payload)
 }
 
-async function processImage(image: Electron.NativeImage, request: CaptureRequest): Promise<ProcessedCapture> {
+async function processImage(
+  image: Electron.NativeImage,
+  request: CaptureRequest,
+  onOcrProgress?: (payload: OcrProgressPayload) => void
+): Promise<ProcessedCapture> {
   const imageDataUrl = image.toDataURL()
   const notices: string[] = []
 
   return withTempImage(image, 'snap-translate', async (imagePath) => {
+    console.info('[capture] OCR starting')
     const ocrResult = await recognizeText(imagePath, request.sourceLanguage)
+    console.info(`[capture] OCR finished, chars=${ocrResult.text.length}`)
+    onOcrProgress?.({
+      imageDataUrl,
+      recognizedText: ocrResult.text,
+      sourceLanguage: request.sourceLanguage,
+      targetLanguage: request.targetLanguage,
+      ocrProvider: ocrResult.provider
+    })
+
     const translation = await translateText({
       text: ocrResult.text,
       sourceLanguage: request.sourceLanguage,
@@ -454,7 +608,7 @@ async function probeCaptureSupport(): Promise<CaptureProbeResult> {
 async function startOverlayCapture(request: CaptureRequest): Promise<ProcessedCapture> {
   if (shouldPreferSystemCapture()) {
     const fallbackImage = await captureViaSystemTool()
-    return processImage(fallbackImage, request)
+    return processImage(fallbackImage, request, emitOcrProgress)
   }
 
   let image: Electron.NativeImage
@@ -463,7 +617,7 @@ async function startOverlayCapture(request: CaptureRequest): Promise<ProcessedCa
     ;({ image } = await getDisplaySourceThumbnail())
   } catch {
     const fallbackImage = await captureViaSystemTool()
-    return processImage(fallbackImage, request)
+    return processImage(fallbackImage, request, emitOcrProgress)
   }
   const imageSize = image.getSize()
 
@@ -555,7 +709,7 @@ app.whenReady().then(() => {
 
   ipcMain.handle('ocr:clipboard-and-translate', async (_, request: CaptureRequest) => {
     const image = await captureFromClipboard()
-    return processImage(image, request)
+    return processImage(image, request, emitOcrProgress)
   })
 
   ipcMain.handle('ocr:translate-text', async (_, request: TranslateRequest) => {
@@ -576,6 +730,7 @@ app.whenReady().then(() => {
   })
 
   ipcMain.handle('capture:submit-selection', async (event, rect: SelectionRect) => {
+    const sessionId = event.sender.id
     const session = captureSessions.get(event.sender.id)
     const captureWindow = BrowserWindow.fromWebContents(event.sender)
 
@@ -594,19 +749,17 @@ app.whenReady().then(() => {
       width: Math.max(1, Math.floor(rect.width)),
       height: Math.max(1, Math.floor(rect.height))
     })
+    const request = session.request
+    const resolveCapture = session.resolve
+    const rejectCapture = session.reject
 
-    try {
-      const result = await processImage(cropped, session.request)
-      session.resolve(result)
-      captureSessions.delete(event.sender.id)
+    captureSessions.delete(sessionId)
+    if (!captureWindow.isDestroyed()) {
       captureWindow.destroy()
-      return true
-    } catch (error) {
-      session.reject(error)
-      captureSessions.delete(event.sender.id)
-      captureWindow.destroy()
-      throw error
     }
+
+    void processImage(cropped, request, emitOcrProgress).then(resolveCapture).catch(rejectCapture)
+    return true
   })
 
   ipcMain.handle('capture:probe', async () => {

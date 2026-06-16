@@ -19,6 +19,14 @@ type SelectionRect = {
   height: number
 }
 
+type OcrProgressPayload = {
+  imageDataUrl: string
+  recognizedText: string
+  sourceLanguage: string
+  targetLanguage: string
+  ocrProvider: string
+}
+
 const api = {
   captureAndTranslate: (request: CaptureRequest) => ipcRenderer.invoke('ocr:capture-and-translate', request),
   translateClipboardImage: (request: CaptureRequest) =>
@@ -27,7 +35,13 @@ const api = {
   getCaptureSession: () => ipcRenderer.invoke('capture:get-session'),
   submitCaptureSelection: (rect: SelectionRect) => ipcRenderer.invoke('capture:submit-selection', rect),
   cancelCapture: () => ipcRenderer.invoke('capture:cancel'),
-  probeCaptureSupport: () => ipcRenderer.invoke('capture:probe')
+  probeCaptureSupport: () => ipcRenderer.invoke('capture:probe'),
+  onOcrProgress: (callback: (payload: OcrProgressPayload) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, payload: OcrProgressPayload): void => callback(payload)
+
+    ipcRenderer.on('ocr:progress', listener)
+    return () => ipcRenderer.removeListener('ocr:progress', listener)
+  }
 }
 
 if (process.contextIsolated) {

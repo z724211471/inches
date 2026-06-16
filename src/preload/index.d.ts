@@ -47,6 +47,14 @@ type CaptureProbeResult = {
   message: string
 }
 
+type OcrProgressPayload = {
+  imageDataUrl: string
+  recognizedText: string
+  sourceLanguage: string
+  targetLanguage: string
+  ocrProvider: string
+}
+
 type SnapTranslateApi = {
   captureAndTranslate: (request: CaptureRequest) => Promise<ProcessedCapture>
   translateClipboardImage: (request: CaptureRequest) => Promise<ProcessedCapture>
@@ -55,6 +63,7 @@ type SnapTranslateApi = {
   submitCaptureSelection: (rect: SelectionRect) => Promise<boolean>
   cancelCapture: () => Promise<boolean>
   probeCaptureSupport: () => Promise<CaptureProbeResult>
+  onOcrProgress: (callback: (payload: OcrProgressPayload) => void) => () => void
 }
 
 declare global {

@@ -1,4 +1,14 @@
-import { app, clipboard, BrowserWindow, desktopCapturer, ipcMain, nativeImage, screen, shell } from 'electron'
+import {
+  app,
+  clipboard,
+  BrowserWindow,
+  desktopCapturer,
+  ipcMain,
+  nativeImage,
+  safeStorage,
+  screen,
+  shell
+} from 'electron'
 import { join } from 'path'
 import { promises as fs } from 'fs'
 import { tmpdir } from 'os'
@@ -6,10 +16,16 @@ import { execFile } from 'child_process'
 import { promisify } from 'util'
 import { electronApp, is, optimizer } from '@electron-toolkit/utils'
 import icon from '../../resources/icon.png?asset'
+import { describeMacSystemCaptureError } from './capture-errors'
+import {
+  buildTranslateRequestFromCapture,
+  type CaptureTranslationOptions,
+  type TranslationProviderId
+} from './translation-request'
 
 const execFileAsync = promisify(execFile)
 const HY_MT_MODEL = 'tencent/Hy-MT2-1.8B-GGUF:Q4_K_M'
-const HY_MT_LOCAL_MODEL = join(process.cwd(), 'models', 'Hy-MT2-1.8B-GGUF', 'Hy-MT2-1.8B-Q4_K_M.gguf')
+const HY_MT_LOCAL_MODEL_SEGMENTS = ['Hy-MT2-1.8B-GGUF', 'Hy-MT2-1.8B-Q4_K_M.gguf']
 const HY_MT_MAX_TOKENS = '512'
 const HY_MT_TIMEOUT_MS = 10 * 60_000
 const LLAMA_CLI_CANDIDATES = [
@@ -21,21 +37,42 @@ const LLAMA_CLI_CANDIDATES = [
 
 app.commandLine.appendSwitch('enable-features', 'TranslationAPI,LanguageDetectionAPI')
 
-type CaptureRequest = {
-  sourceLanguage: string
-  targetLanguage: string
-}
+type CaptureRequest = CaptureTranslationOptions
 
 type TranslateRequest = {
   text: string
   sourceLanguage: string
   targetLanguage: string
+  translationProvider?: TranslationProviderId
+  onlineModel?: string
+  onlineApiKey?: string
 }
 
 type TranslationResult = {
   provider: string
   text: string | null
   warning?: string
+  elapsedMs?: number
+}
+
+type TranslationProviderOption = {
+  id: TranslationProviderId
+  label: string
+  defaultModel: string
+  requiresApiKey: boolean
+}
+
+type TranslationSettings = {
+  provider: TranslationProviderId
+  model: string
+  apiKey: string
+}
+
+type StoredTranslationSettings = {
+  provider?: TranslationProviderId
+  model?: string
+  apiKey?: string
+  apiKeyEncrypted?: boolean
 }
 
 type ProcessedCapture = {
@@ -89,8 +126,117 @@ const languageNames: Record<string, string> = {
   'de-DE': '德语'
 }
 
+const translationProviders: TranslationProviderOption[] = [
+  {
+    id: 'hy-mt-local',
+    label: '本地 Hy-MT2 1.8B GGUF',
+    defaultModel: 'Hy-MT2-1.8B-Q4_K_M',
+    requiresApiKey: false
+  },
+  {
+    id: 'openai',
+    label: 'ChatGPT / OpenAI',
+    defaultModel: 'gpt-4o-mini',
+    requiresApiKey: true
+  },
+  {
+    id: 'deepseek',
+    label: 'DeepSeek',
+    defaultModel: 'deepseek-chat',
+    requiresApiKey: true
+  },
+  {
+    id: 'gemini',
+    label: 'Gemini',
+    defaultModel: 'gemini-1.5-flash',
+    requiresApiKey: true
+  }
+]
+
+const DEFAULT_TRANSLATION_SETTINGS: TranslationSettings = {
+  provider: 'hy-mt-local',
+  model: 'Hy-MT2-1.8B-Q4_K_M',
+  apiKey: ''
+}
+
+const ONLINE_TRANSLATION_TIMEOUT_MS = 120_000
+
 let mainWindow: BrowserWindow | null = null
 const captureSessions = new Map<number, CaptureSession>()
+
+function getTranslationSettingsPath(): string {
+  return join(app.getPath('userData'), 'translation-settings.json')
+}
+
+function getTranslationProvider(provider?: string): TranslationProviderOption {
+  return translationProviders.find((item) => item.id === provider) ?? translationProviders[0]
+}
+
+function normalizeTranslationSettings(settings: Partial<TranslationSettings>): TranslationSettings {
+  const provider = getTranslationProvider(settings.provider).id
+  return {
+    provider,
+    model: settings.model?.trim() || getTranslationProvider(provider).defaultModel,
+    apiKey: settings.apiKey ?? ''
+  }
+}
+
+function encryptApiKey(apiKey: string): Pick<StoredTranslationSettings, 'apiKey' | 'apiKeyEncrypted'> {
+  if (!apiKey) {
+    return { apiKey: '', apiKeyEncrypted: false }
+  }
+
+  if (!safeStorage.isEncryptionAvailable()) {
+    return { apiKey, apiKeyEncrypted: false }
+  }
+
+  return {
+    apiKey: safeStorage.encryptString(apiKey).toString('base64'),
+    apiKeyEncrypted: true
+  }
+}
+
+function decryptApiKey(stored: StoredTranslationSettings): string {
+  if (!stored.apiKey) {
+    return ''
+  }
+
+  if (!stored.apiKeyEncrypted) {
+    return stored.apiKey
+  }
+
+  try {
+    return safeStorage.decryptString(Buffer.from(stored.apiKey, 'base64'))
+  } catch {
+    return ''
+  }
+}
+
+async function loadTranslationSettings(): Promise<TranslationSettings> {
+  try {
+    const payload = JSON.parse(await fs.readFile(getTranslationSettingsPath(), 'utf8')) as StoredTranslationSettings
+    return normalizeTranslationSettings({
+      provider: payload.provider,
+      model: payload.model,
+      apiKey: decryptApiKey(payload)
+    })
+  } catch {
+    return DEFAULT_TRANSLATION_SETTINGS
+  }
+}
+
+async function saveTranslationSettings(settings: TranslationSettings): Promise<TranslationSettings> {
+  const normalized = normalizeTranslationSettings(settings)
+  const encrypted = encryptApiKey(normalized.apiKey)
+  const stored: StoredTranslationSettings = {
+    provider: normalized.provider,
+    model: normalized.model,
+    ...encrypted
+  }
+
+  await fs.writeFile(getTranslationSettingsPath(), `${JSON.stringify(stored, null, 2)}\n`, 'utf8')
+  return normalized
+}
 
 function shouldPreferSystemCapture(): boolean {
   return process.platform === 'darwin' && app.isPackaged
@@ -99,15 +245,16 @@ function shouldPreferSystemCapture(): boolean {
 async function captureViaSystemTool(): Promise<Electron.NativeImage> {
   if (process.platform === 'darwin') {
     const filePath = join(tmpdir(), `system-capture-${Date.now()}.png`)
-    await execFileAsync('screencapture', ['-i', '-x', filePath], { maxBuffer: 4 * 1024 * 1024 })
-
     try {
+      await execFileAsync('screencapture', ['-i', '-x', filePath], { maxBuffer: 4 * 1024 * 1024 })
       const buffer = await fs.readFile(filePath)
       const image = nativeImage.createFromBuffer(buffer)
       if (image.isEmpty()) {
         throw new Error('系统截图未返回图片内容。')
       }
       return image
+    } catch (error) {
+      throw new Error(describeMacSystemCaptureError(error))
     } finally {
       await fs.unlink(filePath).catch(() => undefined)
     }
@@ -296,7 +443,20 @@ async function captureFromClipboard(): Promise<Electron.NativeImage> {
 }
 
 async function translateText(request: TranslateRequest): Promise<TranslationResult> {
-  return translateWithHyMt(request)
+  const startedAt = performance.now()
+  const provider = getTranslationProvider(request.translationProvider)
+  let result: TranslationResult
+
+  if (provider.id === 'hy-mt-local') {
+    result = await translateWithHyMt(request)
+  } else {
+    result = await translateWithOnlineModel(request, provider)
+  }
+
+  return {
+    ...result,
+    elapsedMs: Math.round(performance.now() - startedAt)
+  }
 }
 
 function getLanguageName(language: string): string {
@@ -305,6 +465,167 @@ function getLanguageName(language: string): string {
 
 function buildHyMtPrompt({ text, targetLanguage }: TranslateRequest): string {
   return `将以下文本翻译为 ${getLanguageName(targetLanguage)}，注意只需要输出翻译后的结果，不要额外解释：\n\n${text}`
+}
+
+function buildOnlineMessages({ text, sourceLanguage, targetLanguage }: TranslateRequest): Array<{ role: string; content: string }> {
+  return [
+    {
+      role: 'system',
+      content:
+        'You are a precise translation engine. Return only the translated text. Do not explain, summarize, add markdown, or wrap the result in quotes.'
+    },
+    {
+      role: 'user',
+      content: `Translate from ${getLanguageName(sourceLanguage)} to ${getLanguageName(targetLanguage)}:\n\n${text}`
+    }
+  ]
+}
+
+async function fetchJsonWithTimeout(url: string, init: RequestInit): Promise<unknown> {
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), ONLINE_TRANSLATION_TIMEOUT_MS)
+
+  try {
+    const response = await fetch(url, {
+      ...init,
+      signal: controller.signal
+    })
+    const responseText = await response.text()
+    const payload = responseText ? (JSON.parse(responseText) as unknown) : null
+
+    if (!response.ok) {
+      const message =
+        typeof payload === 'object' && payload && 'error' in payload
+          ? JSON.stringify((payload as { error: unknown }).error)
+          : responseText
+      throw new Error(`HTTP ${response.status}: ${message}`)
+    }
+
+    return payload
+  } finally {
+    clearTimeout(timeout)
+  }
+}
+
+function extractOpenAiCompatibleText(payload: unknown): string {
+  const choices = (payload as { choices?: Array<{ message?: { content?: string } }> }).choices
+  return choices?.[0]?.message?.content?.trim() ?? ''
+}
+
+function extractGeminiText(payload: unknown): string {
+  const candidates = (payload as { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }> }).candidates
+  return candidates?.[0]?.content?.parts?.map((part) => part.text ?? '').join('').trim() ?? ''
+}
+
+async function translateWithOpenAiCompatible(
+  request: TranslateRequest,
+  provider: TranslationProviderOption,
+  endpoint: string
+): Promise<TranslationResult> {
+  const model = request.onlineModel?.trim() || provider.defaultModel
+  const payload = await fetchJsonWithTimeout(endpoint, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${request.onlineApiKey}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      model,
+      messages: buildOnlineMessages(request),
+      temperature: 0.1
+    })
+  })
+
+  return {
+    provider: `${provider.label} (${model})`,
+    text: extractOpenAiCompatibleText(payload) || null,
+    warning: extractOpenAiCompatibleText(payload) ? undefined : '在线模型未返回翻译文本。'
+  }
+}
+
+async function translateWithGemini(request: TranslateRequest, provider: TranslationProviderOption): Promise<TranslationResult> {
+  const model = request.onlineModel?.trim() || provider.defaultModel
+  const prompt = buildOnlineMessages(request)
+    .map((message) => `${message.role.toUpperCase()}:\n${message.content}`)
+    .join('\n\n')
+  const payload = await fetchJsonWithTimeout(
+    `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(
+      request.onlineApiKey ?? ''
+    )}`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        contents: [
+          {
+            role: 'user',
+            parts: [{ text: prompt }]
+          }
+        ],
+        generationConfig: {
+          temperature: 0.1
+        }
+      })
+    }
+  )
+
+  const text = extractGeminiText(payload)
+  return {
+    provider: `${provider.label} (${model})`,
+    text: text || null,
+    warning: text ? undefined : 'Gemini 未返回翻译文本。'
+  }
+}
+
+async function translateWithOnlineModel(
+  request: TranslateRequest,
+  provider: TranslationProviderOption
+): Promise<TranslationResult> {
+  if (!request.text.trim()) {
+    return {
+      provider: provider.label,
+      text: null,
+      warning: '没有可翻译的文本。'
+    }
+  }
+
+  if (!request.onlineApiKey?.trim()) {
+    return {
+      provider: provider.label,
+      text: null,
+      warning: `${provider.label} 需要填写 API Key。`
+    }
+  }
+
+  try {
+    console.info(
+      `[translate] using online provider=${provider.id} model=${request.onlineModel?.trim() || provider.defaultModel} chars=${request.text.length}`
+    )
+
+    if (provider.id === 'gemini') {
+      return await translateWithGemini(request, provider)
+    }
+
+    const endpoint =
+      provider.id === 'deepseek' ? 'https://api.deepseek.com/chat/completions' : 'https://api.openai.com/v1/chat/completions'
+    return await translateWithOpenAiCompatible(request, provider, endpoint)
+  } catch (error) {
+    return {
+      provider: provider.label,
+      text: null,
+      warning: `在线模型翻译失败: ${error instanceof Error ? error.message : String(error)}`
+    }
+  }
+}
+
+function formatElapsed(ms: number): string {
+  if (ms < 1000) {
+    return `${ms}ms`
+  }
+
+  return `${(ms / 1000).toFixed(1)}s`
 }
 
 async function resolveLlamaCliPath(): Promise<string> {
@@ -325,9 +646,16 @@ async function resolveLlamaCliPath(): Promise<string> {
 }
 
 async function resolveHyMtModelArgs(): Promise<string[]> {
-  const localModelCandidates = [process.env['HY_MT_MODEL_PATH'], HY_MT_LOCAL_MODEL].filter(
-    (item): item is string => Boolean(item)
-  )
+  const appPath = app.getAppPath()
+  const appBasePath = appPath.endsWith('.asar') ? appPath.slice(0, -5) : appPath
+  const localModelCandidates = [
+    process.env['HY_MT_MODEL_PATH'],
+    join(process.cwd(), 'models', ...HY_MT_LOCAL_MODEL_SEGMENTS),
+    join(appBasePath, 'models', ...HY_MT_LOCAL_MODEL_SEGMENTS),
+    join(appBasePath + '.unpacked', 'models', ...HY_MT_LOCAL_MODEL_SEGMENTS),
+    join(process.resourcesPath, 'app.asar.unpacked', 'models', ...HY_MT_LOCAL_MODEL_SEGMENTS),
+    join(process.resourcesPath, 'models', ...HY_MT_LOCAL_MODEL_SEGMENTS)
+  ].filter((item): item is string => Boolean(item))
 
   for (const candidate of localModelCandidates) {
     try {
@@ -482,13 +810,16 @@ async function processImage(
   request: CaptureRequest,
   onOcrProgress?: (payload: OcrProgressPayload) => void
 ): Promise<ProcessedCapture> {
+  const startedAt = performance.now()
   const imageDataUrl = image.toDataURL()
   const notices: string[] = []
 
   return withTempImage(image, 'snap-translate', async (imagePath) => {
     console.info('[capture] OCR starting')
+    const ocrStartedAt = performance.now()
     const ocrResult = await recognizeText(imagePath, request.sourceLanguage)
-    console.info(`[capture] OCR finished, chars=${ocrResult.text.length}`)
+    const ocrElapsedMs = Math.round(performance.now() - ocrStartedAt)
+    console.info(`[capture] OCR finished, chars=${ocrResult.text.length}, elapsed=${formatElapsed(ocrElapsedMs)}`)
     onOcrProgress?.({
       imageDataUrl,
       recognizedText: ocrResult.text,
@@ -497,15 +828,17 @@ async function processImage(
       ocrProvider: ocrResult.provider
     })
 
-    const translation = await translateText({
-      text: ocrResult.text,
-      sourceLanguage: request.sourceLanguage,
-      targetLanguage: request.targetLanguage
-    })
+    const translation = await translateText(buildTranslateRequestFromCapture(ocrResult.text, request))
+    const totalElapsedMs = Math.round(performance.now() - startedAt)
 
     if (translation.warning) {
       notices.push(translation.warning)
     }
+    notices.push(
+      `耗时统计：OCR ${formatElapsed(ocrElapsedMs)} · 翻译 ${translation.provider} ${formatElapsed(
+        translation.elapsedMs ?? 0
+      )} · 总计 ${formatElapsed(totalElapsedMs)}`
+    )
 
     return {
       imageDataUrl,
@@ -714,6 +1047,18 @@ app.whenReady().then(() => {
 
   ipcMain.handle('ocr:translate-text', async (_, request: TranslateRequest) => {
     return translateText(request)
+  })
+
+  ipcMain.handle('translation:get-providers', async () => {
+    return translationProviders
+  })
+
+  ipcMain.handle('translation:get-settings', async () => {
+    return loadTranslationSettings()
+  })
+
+  ipcMain.handle('translation:save-settings', async (_, settings: TranslationSettings) => {
+    return saveTranslationSettings(settings)
   })
 
   ipcMain.handle('capture:get-session', async (event) => {

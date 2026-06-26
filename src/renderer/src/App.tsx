@@ -4,6 +4,8 @@ type CaptureResult = Awaited<ReturnType<typeof window.api.captureAndTranslate>>
 type TranslateResult = Awaited<ReturnType<typeof window.api.translateText>>
 type CaptureSessionPayload = Awaited<ReturnType<typeof window.api.getCaptureSession>>
 type CaptureProbeResult = Awaited<ReturnType<typeof window.api.probeCaptureSupport>>
+type TranslationProviderOption = Awaited<ReturnType<typeof window.api.getTranslationProviders>>[number]
+type TranslationSettings = Awaited<ReturnType<typeof window.api.getTranslationSettings>>
 type OcrProgress = Parameters<Parameters<typeof window.api.onOcrProgress>[0]>[0]
 
 type LanguageOption = {
@@ -36,6 +38,18 @@ const targetLanguages: LanguageOption[] = [
   { label: '翻译成韩文', value: 'ko-KR' },
   { label: '翻译成法文', value: 'fr-FR' }
 ]
+
+function formatElapsed(ms?: number): string {
+  if (ms === undefined) {
+    return ''
+  }
+
+  if (ms < 1000) {
+    return `${ms}ms`
+  }
+
+  return `${(ms / 1000).toFixed(1)}s`
+}
 
 function normalizeRect(drag: DragState) {
   const left = Math.min(drag.startX, drag.currentX)
@@ -170,16 +184,26 @@ function CaptureOverlay(): React.JSX.Element {
 }
 
 function MainWorkspace(): React.JSX.Element {
+  const apiReady = Boolean(window.api)
   const [sourceLanguage, setSourceLanguage] = useState('en-US')
   const [targetLanguage, setTargetLanguage] = useState('zh-Hans')
   const [result, setResult] = useState<CaptureResult | null>(null)
   const [partialOcr, setPartialOcr] = useState<OcrProgress | null>(null)
+  const [editableOcrText, setEditableOcrText] = useState('')
   const [manualText, setManualText] = useState('')
   const [manualTranslation, setManualTranslation] = useState<TranslateResult | null>(null)
-  const [busyAction, setBusyAction] = useState<'capture' | 'clipboard' | 'manual' | null>(null)
+  const [busyAction, setBusyAction] = useState<'capture' | 'clipboard' | 'manual' | 'ocr-edit' | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [probe, setProbe] = useState<CaptureProbeResult | null>(null)
   const [probing, setProbing] = useState(false)
+  const [translationProviders, setTranslationProviders] = useState<TranslationProviderOption[]>([])
+  const [translationSettings, setTranslationSettings] = useState<TranslationSettings>({
+    provider: 'hy-mt-local',
+    model: 'Hy-MT2-1.8B-Q4_K_M',
+    apiKey: ''
+  })
+  const [savingTranslationSettings, setSavingTranslationSettings] = useState(false)
+  const [settingsMessage, setSettingsMessage] = useState<string | null>(null)
 
   const sourceLabel = useMemo(
     () => sourceLanguages.find((item) => item.value === sourceLanguage)?.label ?? sourceLanguage,
@@ -189,16 +213,36 @@ function MainWorkspace(): React.JSX.Element {
     () => targetLanguages.find((item) => item.value === targetLanguage)?.label ?? targetLanguage,
     [targetLanguage]
   )
+  const activeTranslationProvider = useMemo(
+    () => translationProviders.find((item) => item.id === translationSettings.provider) ?? translationProviders[0],
+    [translationProviders, translationSettings.provider]
+  )
+  const translationRequestConfig = {
+    translationProvider: translationSettings.provider,
+    onlineModel: translationSettings.model,
+    onlineApiKey: translationSettings.apiKey
+  }
   const busyHint =
     busyAction === 'capture'
-      ? '正在截图、OCR 识别并调用本地 Hy-MT2 模型翻译。首次运行可能需要下载或加载模型，请稍等。'
+      ? `正在截图、OCR 识别并调用 ${activeTranslationProvider?.label ?? '翻译模型'}。`
       : busyAction === 'clipboard'
-        ? '正在读取剪贴板图片、OCR 识别并调用本地 Hy-MT2 模型翻译。'
+        ? `正在读取剪贴板图片、OCR 识别并调用 ${activeTranslationProvider?.label ?? '翻译模型'}。`
         : busyAction === 'manual'
-          ? '正在调用本地 Hy-MT2 模型翻译文本。'
-          : null
+          ? `正在调用 ${activeTranslationProvider?.label ?? '翻译模型'} 翻译文本。`
+          : busyAction === 'ocr-edit'
+            ? '正在用编辑后的 OCR 原文重新翻译。'
+            : null
 
   async function refreshProbe(): Promise<void> {
+    if (!window.api) {
+      setProbe({
+        preferredMode: 'system-fallback',
+        available: false,
+        message: '当前页面没有连接到 Electron preload API。请在应用窗口里使用截图、OCR 和翻译功能。'
+      })
+      return
+    }
+
     setProbing(true)
 
     try {
@@ -216,16 +260,46 @@ function MainWorkspace(): React.JSX.Element {
   }
 
   useEffect(() => {
+    if (!window.api) {
+      void refreshProbe()
+      return
+    }
+
     void refreshProbe()
+    void window.api
+      .getTranslationProviders()
+      .then((providers) => {
+        setTranslationProviders(providers)
+      })
+      .catch((settingsError) => {
+        setError(settingsError instanceof Error ? settingsError.message : String(settingsError))
+      })
+    void window.api
+      .getTranslationSettings()
+      .then((settings) => {
+        setTranslationSettings(settings)
+      })
+      .catch((settingsError) => {
+        setError(settingsError instanceof Error ? settingsError.message : String(settingsError))
+      })
   }, [])
 
   useEffect(() => {
+    if (!window.api) {
+      return undefined
+    }
+
     return window.api.onOcrProgress((payload) => {
       setPartialOcr(payload)
     })
   }, [])
 
   async function runAction(action: 'capture' | 'clipboard'): Promise<void> {
+    if (!window.api) {
+      setError('当前页面没有连接到 Electron preload API。请在应用窗口里使用截图、OCR 和翻译功能。')
+      return
+    }
+
     setBusyAction(action)
     setError(null)
     setPartialOcr(null)
@@ -233,10 +307,11 @@ function MainWorkspace(): React.JSX.Element {
     try {
       const response =
         action === 'capture'
-          ? await window.api.captureAndTranslate({ sourceLanguage, targetLanguage })
-          : await window.api.translateClipboardImage({ sourceLanguage, targetLanguage })
+          ? await window.api.captureAndTranslate({ sourceLanguage, targetLanguage, ...translationRequestConfig })
+          : await window.api.translateClipboardImage({ sourceLanguage, targetLanguage, ...translationRequestConfig })
 
       setResult(response)
+      setEditableOcrText(response.recognizedText)
       setPartialOcr(null)
       if (action === 'capture') {
         void refreshProbe()
@@ -252,6 +327,11 @@ function MainWorkspace(): React.JSX.Element {
   }
 
   async function translateManualText(): Promise<void> {
+    if (!window.api) {
+      setError('当前页面没有连接到 Electron preload API。请在应用窗口里使用翻译功能。')
+      return
+    }
+
     setBusyAction('manual')
     setError(null)
 
@@ -259,13 +339,75 @@ function MainWorkspace(): React.JSX.Element {
       const response = await window.api.translateText({
         text: manualText,
         sourceLanguage,
-        targetLanguage
+        targetLanguage,
+        ...translationRequestConfig
       })
       setManualTranslation(response)
     } catch (actionError) {
       setError(actionError instanceof Error ? actionError.message : String(actionError))
     } finally {
       setBusyAction(null)
+    }
+  }
+
+  async function translateEditedOcrText(): Promise<void> {
+    if (!result) {
+      return
+    }
+
+    if (!window.api) {
+      setError('当前页面没有连接到 Electron preload API。请在应用窗口里使用翻译功能。')
+      return
+    }
+
+    setBusyAction('ocr-edit')
+    setError(null)
+
+    try {
+      const response = await window.api.translateText({
+        text: editableOcrText,
+        sourceLanguage,
+        targetLanguage,
+        ...translationRequestConfig
+      })
+
+      setResult({
+        ...result,
+        recognizedText: editableOcrText,
+        translatedText: response.text,
+        sourceLanguage,
+        targetLanguage,
+        translationProvider: response.provider,
+        notices: [
+          ...(response.warning ? [response.warning] : []),
+          `翻译引擎：${response.provider}${response.elapsedMs !== undefined ? ` · 耗时 ${formatElapsed(response.elapsedMs)}` : ''}`
+        ]
+      })
+    } catch (actionError) {
+      setError(actionError instanceof Error ? actionError.message : String(actionError))
+    } finally {
+      setBusyAction(null)
+    }
+  }
+
+  async function saveSettings(): Promise<void> {
+    if (!window.api) {
+      setError('当前页面没有连接到 Electron preload API。请在应用窗口里保存模型设置。')
+      return
+    }
+
+    setSavingTranslationSettings(true)
+    setSettingsMessage(null)
+    setError(null)
+
+    try {
+      const savedSettings = await window.api.saveTranslationSettings(translationSettings)
+      setTranslationSettings(savedSettings)
+      setSettingsMessage('模型设置已保存。')
+    } catch (settingsError) {
+      setError(settingsError instanceof Error ? settingsError.message : String(settingsError))
+    } finally {
+      setSavingTranslationSettings(false)
     }
   }
 
@@ -348,12 +490,85 @@ function MainWorkspace(): React.JSX.Element {
             </label>
           </div>
 
+          <div className="model-card">
+            <div className="manual-head">
+              <h3>翻译模型</h3>
+              <button
+                className="text-button"
+                type="button"
+                onClick={() => void saveSettings()}
+                disabled={!apiReady || savingTranslationSettings}
+              >
+                {savingTranslationSettings ? '保存中...' : '保存'}
+              </button>
+            </div>
+
+            <div className="field-grid model-fields">
+              <label className="field">
+                <span>模型服务</span>
+                <select
+                  value={translationSettings.provider}
+                  onChange={(event) => {
+                    const nextProvider = translationProviders.find((item) => item.id === event.target.value)
+                    setTranslationSettings((current) => ({
+                      ...current,
+                      provider: event.target.value as TranslationSettings['provider'],
+                      model: nextProvider?.defaultModel ?? current.model,
+                      apiKey: nextProvider?.requiresApiKey ? current.apiKey : ''
+                    }))
+                    setSettingsMessage(null)
+                  }}
+                >
+                  {translationProviders.map((provider) => (
+                    <option key={provider.id} value={provider.id}>
+                      {provider.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              <label className="field">
+                <span>模型名</span>
+                <input
+                  value={translationSettings.model}
+                  onChange={(event) => {
+                    setTranslationSettings((current) => ({ ...current, model: event.target.value }))
+                    setSettingsMessage(null)
+                  }}
+                  placeholder={activeTranslationProvider?.defaultModel ?? 'model'}
+                />
+              </label>
+
+              {activeTranslationProvider?.requiresApiKey && (
+                <label className="field">
+                  <span>API Key</span>
+                  <input
+                    value={translationSettings.apiKey}
+                    onChange={(event) => {
+                      setTranslationSettings((current) => ({ ...current, apiKey: event.target.value }))
+                      setSettingsMessage(null)
+                    }}
+                    type="password"
+                    placeholder="粘贴对应服务的 API Key"
+                  />
+                </label>
+              )}
+            </div>
+
+            <p className="status-message compact">
+              {activeTranslationProvider?.requiresApiKey
+                ? '在线模型会把 OCR 文本发给对应服务，并使用这里填写的 API Key。'
+                : '本地 Hy-MT2 不需要 API Key，但需要本机可用的 llama-cli 和模型文件。'}
+            </p>
+            {settingsMessage && <p className="notice-line">{settingsMessage}</p>}
+          </div>
+
           <div className="action-row">
             <button
               className="primary-button"
               type="button"
               onClick={() => void runAction('capture')}
-              disabled={busyAction !== null}
+              disabled={!apiReady || busyAction !== null}
             >
               {busyAction === 'capture'
                 ? '截图识别翻译中...'
@@ -365,7 +580,7 @@ function MainWorkspace(): React.JSX.Element {
               className="secondary-button"
               type="button"
               onClick={() => void runAction('clipboard')}
-              disabled={busyAction !== null}
+              disabled={!apiReady || busyAction !== null}
             >
               {busyAction === 'clipboard' ? '读取剪贴板中...' : '翻译剪贴板图片'}
             </button>
@@ -391,7 +606,7 @@ function MainWorkspace(): React.JSX.Element {
                 className="text-button"
                 type="button"
                 onClick={() => void translateManualText()}
-                disabled={busyAction !== null || !manualText.trim()}
+                disabled={!apiReady || busyAction !== null || !manualText.trim()}
               >
                 {busyAction === 'manual' ? '翻译中...' : '翻译文本'}
               </button>
@@ -404,6 +619,10 @@ function MainWorkspace(): React.JSX.Element {
             {manualTranslation && (
               <div className="manual-result">
                 <p>{manualTranslation.text ?? '当前系统未返回可用翻译结果。'}</p>
+                <p className="notice-line">
+                  翻译引擎：{manualTranslation.provider}
+                  {manualTranslation.elapsedMs !== undefined ? ` · 耗时 ${formatElapsed(manualTranslation.elapsedMs)}` : ''}
+                </p>
                 {manualTranslation.warning && <p className="notice-line">{manualTranslation.warning}</p>}
               </div>
             )}
@@ -443,15 +662,30 @@ function MainWorkspace(): React.JSX.Element {
                 <section className="text-card">
                   <div className="text-card-head">
                     <h3>OCR 原文</h3>
-                    <button
-                      className="text-button"
-                      type="button"
-                      onClick={() => void navigator.clipboard.writeText(result.recognizedText)}
-                    >
-                      复制
-                    </button>
+                    <div className="button-group">
+                      <button
+                        className="text-button"
+                        type="button"
+                        onClick={() => void translateEditedOcrText()}
+                        disabled={!apiReady || busyAction !== null || !editableOcrText.trim()}
+                      >
+                        {busyAction === 'ocr-edit' ? '翻译中...' : '重新翻译'}
+                      </button>
+                      <button
+                        className="text-button"
+                        type="button"
+                        onClick={() => void navigator.clipboard.writeText(editableOcrText)}
+                      >
+                        复制
+                      </button>
+                    </div>
                   </div>
-                  <pre>{result.recognizedText || '没有识别到文本。'}</pre>
+                  <textarea
+                    className="ocr-editor"
+                    value={editableOcrText}
+                    onChange={(event) => setEditableOcrText(event.target.value)}
+                    placeholder="没有识别到文本，也可以在这里手动输入后重新翻译。"
+                  />
                 </section>
 
                 <section className="text-card">
@@ -491,7 +725,7 @@ function MainWorkspace(): React.JSX.Element {
                 </div>
                 <div className="meta-card">
                   <span>翻译引擎</span>
-                  <strong>Hy-MT2 1.8B GGUF</strong>
+                  <strong>{activeTranslationProvider?.label ?? '翻译模型'}</strong>
                 </div>
               </div>
 
@@ -514,7 +748,7 @@ function MainWorkspace(): React.JSX.Element {
                   <div className="text-card-head">
                     <h3>翻译结果</h3>
                   </div>
-                  <pre>OCR 已完成，正在等待本地 Hy-MT2 模型返回翻译结果...</pre>
+                  <pre>OCR 已完成，正在等待 {activeTranslationProvider?.label ?? '翻译模型'} 返回翻译结果...</pre>
                 </section>
               </div>
             </div>

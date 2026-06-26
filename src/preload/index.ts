@@ -4,12 +4,26 @@ import { electronAPI } from '@electron-toolkit/preload'
 type CaptureRequest = {
   sourceLanguage: string
   targetLanguage: string
+  translationProvider?: TranslationProviderId
+  onlineModel?: string
+  onlineApiKey?: string
 }
 
 type TranslateRequest = {
   text: string
   sourceLanguage: string
   targetLanguage: string
+  translationProvider?: TranslationProviderId
+  onlineModel?: string
+  onlineApiKey?: string
+}
+
+type TranslationProviderId = 'hy-mt-local' | 'openai' | 'deepseek' | 'gemini'
+
+type TranslationSettings = {
+  provider: TranslationProviderId
+  model: string
+  apiKey: string
 }
 
 type SelectionRect = {
@@ -32,6 +46,9 @@ const api = {
   translateClipboardImage: (request: CaptureRequest) =>
     ipcRenderer.invoke('ocr:clipboard-and-translate', request),
   translateText: (request: TranslateRequest) => ipcRenderer.invoke('ocr:translate-text', request),
+  getTranslationProviders: () => ipcRenderer.invoke('translation:get-providers'),
+  getTranslationSettings: () => ipcRenderer.invoke('translation:get-settings'),
+  saveTranslationSettings: (settings: TranslationSettings) => ipcRenderer.invoke('translation:save-settings', settings),
   getCaptureSession: () => ipcRenderer.invoke('capture:get-session'),
   submitCaptureSelection: (rect: SelectionRect) => ipcRenderer.invoke('capture:submit-selection', rect),
   cancelCapture: () => ipcRenderer.invoke('capture:cancel'),
